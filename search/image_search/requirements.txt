@@ -1,0 +1,22 @@
+# Core ML
+torch>=2.1.0
+torchvision>=0.16.0
+transformers>=4.37.0
+open_clip_torch>=2.24.0
+
+# CLIP (OpenAI)
+clip @ git+https://github.com/openai/CLIP.git
+
+# ANN Index
+faiss-cpu>=1.7.4  # use faiss-gpu if GPU available
+
+# Data processing
+numpy>=1.24.0
+Pillow>=10.0.0
+scikit-learn>=1.3.0
+
+# Experiment tracking
+mlflow>=2.10.0
+
+# Utilities
+tqdm>=4.66.0

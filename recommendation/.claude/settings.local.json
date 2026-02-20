@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(/Users/chi.wang/workspace/cw/system_designs/recommendation/ml_algorithms/.venv/bin/python:*)"
+    ]
+  }
+}
