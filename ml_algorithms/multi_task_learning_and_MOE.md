@@ -1,4 +1,237 @@
-# Mixture of Experts (MoE / MMoE)
+# Multi-Task Learning & Mixture of Experts (MoE / MMoE)
+
+## 0. The Multi-Task Learning Landscape
+
+### What Is Multi-Task Classification?
+
+In many real systems, you need to predict multiple things about the same input at the same time.
+
+```
+Single-task:
+  (user, video) → model → P(click)
+
+Multi-task:
+  (user, video) → model → P(click)
+                        → E[watch_time]
+                        → P(like)
+                        → P(share)
+                        → P(dislike)
+```
+
+**Why train them together instead of five separate models?**
+
+1. **Shared knowledge**: "This video has high production quality" helps predict both watch_time and like. Training jointly lets the model learn this once and use it for all tasks.
+2. **Data efficiency**: Like and share events are rare (sparse signal). Training together with abundant click data regularizes the sparse-signal tasks.
+3. **Serving efficiency**: One model, one forward pass → all predictions at once.
+
+**The fundamental challenge**: tasks sometimes want conflicting representations. Click wants "is the thumbnail flashy?" Watch time wants "is the content actually good?" A single model must serve both — and this tension is what the different architectures below resolve differently.
+
+---
+
+### The Four Approaches — Taxonomy at a Glance
+
+```
+Multi-Task Learning Approaches
+│
+├── 1. Hard Parameter Sharing (Shared-Bottom Multi-Head)
+│      "One backbone, each task gets its own output head"
+│      All tasks share the SAME representation
+│
+├── 2. Soft Parameter Sharing
+│      "Each task has its own network, but they influence each other"
+│      Tasks share loosely via regularization or learned gates
+│
+├── 3. Mixture of Experts (MoE / MMoE)
+│      "Multiple expert networks, each task gates its own blend"
+│      Each task assembles a CUSTOM representation
+│
+└── 4. Task-Specific + Shared Experts (PLE)
+       "Dedicated experts per task + shared experts"
+       Stronger isolation when tasks are very different
+```
+
+| Approach | How tasks share | Task conflict handling | Complexity | Industry use |
+|---|---|---|---|---|
+| **Hard sharing (multi-head)** | Identical shared repr | None — conflict stays | Low | Baseline everywhere |
+| **Soft sharing** | Regularized cross-task influence | Partial — tasks modulate each other | Medium | NLP multi-task, research |
+| **MMoE** | Gated expert blend per task | Strong — each task picks its repr | Medium | YouTube, Google Ads |
+| **PLE** | Task-specific + shared experts | Strongest — full expert isolation option | High | Tencent, TikTok |
+
+---
+
+### Approach 1: Hard Parameter Sharing (Shared-Bottom Multi-Head)
+
+The simplest and most common baseline. One shared backbone, multiple task-specific output heads.
+
+```
+features → [Shared MLP] → shared_repr
+                               │
+                    ┌──────────┼──────────┐
+                    │          │          │
+                [Head 1]   [Head 2]   [Head 3]
+                    │          │          │
+                P(click)  E[watch]   P(like)
+```
+
+**What the shared layers learn**: a single representation that is a compromise across all tasks. It can't be optimal for any one task — it minimizes the average loss across all tasks.
+
+**When it works**: Tasks are homogeneous (similar in nature) and positively correlated. Adding one task helps the others.
+
+```
+Example of well-aligned tasks:
+  P(click) and P(add-to-cart) — both capture user interest signals.
+  Sharing helps both. ✓
+
+Example of conflicting tasks:
+  P(click) and E[watch_time] — thumbnail appeal vs. content quality.
+  Sharing hurts both. ✗
+```
+
+**Code (minimal):**
+```python
+class SharedBottomMultiHead(nn.Module):
+    def __init__(self, input_dim, shared_dim=256, num_tasks=3):
+        super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Linear(input_dim, 512), nn.ReLU(),
+            nn.Linear(512, shared_dim), nn.ReLU(),
+        )
+        self.heads = nn.ModuleList([
+            nn.Linear(shared_dim, 1) for _ in range(num_tasks)
+        ])
+
+    def forward(self, x):
+        shared = self.backbone(x)           # ONE repr for all tasks
+        return [head(shared) for head in self.heads]
+```
+
+**Failure mode to know**: As you add more tasks, the shared backbone must serve more conflicting objectives. AUC of each task *degrades* as num_tasks grows. This is called **negative transfer** — adding a new task makes existing tasks worse.
+
+---
+
+### Approach 2: Soft Parameter Sharing
+
+Each task has its **own model**, but the models are encouraged to stay similar to each other via regularization or learned cross-task influence. Tasks share loosely, not rigidly.
+
+#### Variant A: L2 Regularization Between Task Parameters
+```
+Task 1 model: θ₁
+Task 2 model: θ₂
+
+Loss = L_task1(θ₁) + L_task2(θ₂) + λ × ||θ₁ - θ₂||²
+                                          ↑
+                          Penalty for diverging too far
+```
+The models share knowledge by being penalized for specializing too much. They stay "close" in weight space.
+
+**Pros**: Simple, each task still has full capacity.
+**Cons**: Static — the sharing is the same regardless of input. Good for homogeneous tasks (NLP: POS tagging + NER), poor for heterogeneous tasks (click + watch time).
+
+#### Variant B: Cross-Stitch Networks (2016)
+Learn *input-dependent* sharing between task networks:
+
+```
+Task 1 layer output: h₁
+Task 2 layer output: h₂
+
+Combine via a learned 2×2 mixing matrix:
+  h₁' = α₁₁ × h₁ + α₁₂ × h₂    ← task 1 borrows from task 2
+  h₂' = α₂₁ × h₁ + α₂₂ × h₂    ← task 2 borrows from task 1
+
+α matrix is learned during training:
+  If tasks are similar:   α₁₂ and α₂₁ → large (heavy cross-task sharing)
+  If tasks are different: α₁₂ and α₂₁ → small (tasks stay independent)
+```
+
+```
+Layer-by-layer in two task networks:
+
+Task 1: x → [Layer 1] → h₁ ─┐            ┌─ h₁' → [Layer 2] → ...
+                               ├── Cross ───┤
+Task 2: x → [Layer 1] → h₂ ─┘   Stitch   └─ h₂' → [Layer 2] → ...
+```
+
+**Key advantage**: The model *learns* how much to share at each layer, for each task. Deep layers tend to share less (task-specific) while shallow layers share more (general features).
+
+**Where used**: Computer vision multi-task (detection + depth + segmentation). Less common in production recommender systems due to complexity.
+
+#### Variant C: Gradient Surgery (PCGrad, 2020)
+A training-time trick that fixes task interference by modifying gradients:
+
+```
+Problem:
+  Task 1 gradient: g₁ = [1.0, -0.5, 0.3]
+  Task 2 gradient: g₂ = [-0.8, 0.2, 0.6]
+
+  g₁ · g₂ = (1.0 × -0.8) + (-0.5 × 0.2) + (0.3 × 0.6) = -0.8 - 0.1 + 0.18 = -0.72
+  Negative dot product → tasks pull the shared weights in OPPOSITE directions → interference
+
+PCGrad fix:
+  If g₁ · g₂ < 0:
+    Remove the conflicting component from g₁:
+    g₁' = g₁ - (g₁·g₂/||g₂||²) × g₂   ← project out the conflicting direction
+
+  Apply g₁' instead of g₁ for task 1's update.
+  Both tasks now move in directions that don't hurt each other.
+```
+
+**Pros**: Works with ANY architecture (even single-head models). No model changes needed.
+**Cons**: Extra compute per step. Doesn't fully solve the problem — just reduces interference.
+
+#### When to Use Soft Parameter Sharing
+
+| Situation | Best soft sharing approach |
+|---|---|
+| Research / small models | Cross-stitch networks |
+| Large production model, tasks somewhat related | L2 regularization |
+| Any architecture, want a quick interference fix | PCGrad / Gradient Surgery |
+| Tasks very heterogeneous | Skip to MMoE or PLE |
+
+---
+
+### Approach 3 & 4: MoE / MMoE and PLE
+
+Covered in full detail in the sections below. Summary:
+
+- **MMoE**: Multiple shared experts + per-task gate. Each task picks its own blend. The gate is the key innovation.
+- **PLE**: Adds task-specific experts on top. Complete isolation when tasks need it.
+
+---
+
+### Choosing the Right Approach: Decision Guide
+
+```
+START: How many tasks? How related are they?
+
+Are tasks highly correlated (e.g., click & add-to-cart)?
+  └─► Hard sharing (Shared-Bottom Multi-Head)
+      Simple, effective, lower risk.
+
+Are tasks moderately related with some conflict?
+  └─► MMoE
+      Gating resolves conflict without full isolation.
+      Industry standard for recommendation systems.
+
+Are tasks very different (e.g., click vs. comment vs. watch_time)?
+  └─► PLE
+      Task-specific experts + shared experts.
+      Best quality, more parameters.
+
+Do you have limited data (<1M examples)?
+  └─► Hard sharing or Soft sharing (L2 reg)
+      Fewer parameters → less overfitting.
+
+Do you want to fix interference without changing architecture?
+  └─► Gradient Surgery (PCGrad)
+      Works as a training wrapper on any architecture.
+
+Are you building an LLM and want to scale capacity?
+  └─► Sparse MoE (top-k routing per token)
+      Different goal: compute efficiency, not multi-task.
+      See section 11.
+```
+
+---
 
 ## 1. What Is Mixture of Experts?
 
@@ -670,9 +903,9 @@ Less important for dense MMoE in recommendations (all experts are always used).
 
 ---
 
-## 10. MMoE vs. Shared-Bottom Multi-Head Model
+## 10. MMoE vs. Shared-Bottom Multi-Head: Deep Dive Comparison
 
-This is a common point of confusion. Both architectures train multiple tasks jointly with shared knowledge. The difference is **how knowledge is shared**.
+Quick recap: Approach 1 (hard sharing) and Approach 3 (MMoE) are the two you'll most commonly choose between in production. Here's a detailed walkthrough of the difference.
 
 ### What Is a Shared-Bottom Multi-Head Model?
 
